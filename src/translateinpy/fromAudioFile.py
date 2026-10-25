@@ -111,7 +111,7 @@ async def stream_audio_url(url: str, audio_queue: asyncio.Queue, original_playba
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
     except asyncio.CancelledError:
-        pass
+        raise
     finally:
         if process.returncode is None:
             try:
@@ -260,27 +260,44 @@ async def run(
                 play_task = tg.create_task(play_audio(audio_queue_output))
                 play_original_task = tg.create_task(play_original_audio(original_playback_queue))
                 
-                # Wait for the audio stream to finish reading
-                await stream_task
-                
-                # Wait for all buffered input chunks to be sent to Gemini
-                await audio_queue_input.join()
-                send_task.cancel()
-                
-                # Wait for original playback to finish
-                await original_playback_queue.join()
-                play_original_task.cancel()
-                
+                # Wait until FFmpeg has finished reading the file.
                 await stream_task
 
-                # Tell the sender that no more audio will arrive.
+                # Tell the active sender that no more audio is coming.
                 await audio_queue_input.put(_END)
 
-                # Wait until every audio chunk, including _END, was sent.
+                # Wait until all audio chunks and the _END marker are sent.
                 await audio_queue_input.join()
 
+                # The sender exits itself after sending audio_stream_end=True.
+                await send_task
+
+                # Finish playing the original quiet audio.
+                await original_playback_queue.join()
+                play_original_task.cancel()
+                await asyncio.gather(
+                    play_original_task,
+                    return_exceptions=True,
+                )
+
+                # Give Gemini time to return the final translated audio.
+                try:
+                    await asyncio.wait_for(
+                        audio_queue_output.join(),
+                        timeout=15.0,
+                    )
+                except asyncio.TimeoutError:
+                    print("[Warning] Timed out waiting for final translated audio.")
+
+                # Only cancel receiving/playback after output has had time to finish.
                 receive_task.cancel()
                 play_task.cancel()
+
+                await asyncio.gather(
+                    receive_task,
+                    play_task,
+                    return_exceptions=True,
+                )
                 
     except Exception as e:
         print(f"[Error] Live session error: {e}")

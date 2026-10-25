@@ -1,0 +1,1 @@
+from .fromAudioFile import Translator

@@ -40,6 +40,7 @@ python Get_started_LiveTranslate.py --url "https://storage.googleapis.com/genera
 ```
 """
 
+import os
 import array
 import asyncio
 import argparse
@@ -262,7 +263,7 @@ async def run(
                 play_original_task.cancel()
                 
                 # Give Gemini a few seconds to finish translating and speaking the final chunks
-                await asyncio.sleep(4.0)
+                await asyncio.sleep(10.0)
                 receive_task.cancel()
                 play_task.cancel()
                 
@@ -272,12 +273,13 @@ async def run(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stream audio URL to Gemini Live Translate CLI")
     parser.add_argument("--url", default="https://storage.googleapis.com/generativeai-downloads/gemini-cookbook/audio/gemini-live-translate-sample.wav", help="Audio URL to stream (default: https://storage.googleapis.com/generativeai-downloads/gemini-cookbook/audio/gemini-live-translate-sample.wav)")
-    parser.add_argument("--target", default="es", help="Target translation language code (default: es)")
+    parser.add_argument("--target", default="bn", help="Target translation language code (default: bn)")
+    parser.add_argument("--api_key", default=os.getenv("GEMINI_API_KEY"), help="API key (default: None)")
     parser.add_argument("--original-volume", type=float, default=0.08, help="Volume of original background audio (0.0 to 1.0, default: 0.08)")
     args = parser.parse_args()
 
     try:
-        asyncio.run(run(args.url, args.target, args.original_volume))
+        asyncio.run(run(args.url, args.target, args.api_key, args.original_volume))
     except KeyboardInterrupt:
         print("\n[Info] Interrupted by user. Exiting...")
 

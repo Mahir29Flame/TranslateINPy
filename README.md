@@ -11,3 +11,15 @@ api_key = os.getenv("GEMINI_API_KEY")
 
 Translator("../sample/hi-1.wav", "en", api_key)
 ```
+
+## Installation
+
+```bash
+pip install TranslateINPY
+```
+
+or via UV:
+
+```bash
+uv add TranslateINPy
+```

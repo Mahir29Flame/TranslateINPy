@@ -262,8 +262,12 @@ async def run(
                 await original_playback_queue.join()
                 play_original_task.cancel()
                 
-                # Give Gemini a few seconds to finish translating and speaking the final chunks
-                await asyncio.sleep(10.0)
+                # Give Gemini time to send final output
+                await asyncio.sleep(4.0)
+
+                # Wait until all received audio has actually played
+                await audio_queue_output.join()
+
                 receive_task.cancel()
                 play_task.cancel()
                 

@@ -263,12 +263,10 @@ async def run(
     url: str,
     target_lang: str,
     api_key: str,
-    original_volume: float = 0.08
+    original_volume: float = 0.08,
 ):
-    # Initialize Google GenAI Client
     client = genai.Client(api_key=api_key)
-    
-    # Configure live connection with translation settings
+
     config = types.LiveConnectConfig(
         response_modalities=[types.Modality.AUDIO],
         translation_config=types.TranslationConfig(
@@ -283,17 +281,36 @@ async def run(
     audio_queue_output = asyncio.Queue()
     original_playback_queue = asyncio.Queue()
 
+    # Create this BEFORE receive_responses() uses it.
+    turn_complete_event = asyncio.Event()
+
     model = "gemini-3.5-live-translate-preview"
     print(f"[Info] Connecting to Gemini Live ({model})...")
-    
+
     try:
-        async with client.aio.live.connect(model=model, config=config) as session:
+        async with client.aio.live.connect(
+            model=model,
+            config=config,
+        ) as session:
             print("[Info] Connected successfully. Ready to stream!")
+
             async with asyncio.TaskGroup() as tg:
                 stream_task = tg.create_task(
-                    stream_audio_url(url, audio_queue_input, original_playback_queue, original_volume)
+                    stream_audio_url(
+                        url,
+                        audio_queue_input,
+                        original_playback_queue,
+                        original_volume,
+                    )
                 )
-                send_task = tg.create_task(send_realtime(session, audio_queue_input))
+
+                send_task = tg.create_task(
+                    send_realtime(
+                        session,
+                        audio_queue_input,
+                    )
+                )
+
                 receive_task = tg.create_task(
                     receive_responses(
                         session,
@@ -301,22 +318,34 @@ async def run(
                         turn_complete_event,
                     )
                 )
-                play_task = tg.create_task(play_audio(audio_queue_output))
-                play_original_task = tg.create_task(play_original_audio(original_playback_queue))
-                
-                # Wait until FFmpeg has finished reading the file.
-                # FFmpeg ended, but Gemini is still processing the final audio.
 
-                # Keep send_task alive and send the end-of-input marker.
+                play_task = tg.create_task(
+                    play_audio(audio_queue_output)
+                )
+
+                play_original_task = tg.create_task(
+                    play_original_audio(original_playback_queue)
+                )
+
+                # Critical: wait until FFmpeg has produced and queued
+                # the complete input file.
+                await stream_task
+
+                print(
+                    "[Info] Input finished. Sending end-of-stream marker...",
+                    flush=True,
+                )
+
+                # send_task is still alive here.
                 await audio_queue_input.put(_END)
 
-                # Wait until all audio chunks plus _END are sent to Gemini.
+                # Wait until every input chunk and _END are sent.
                 await audio_queue_input.join()
 
-                # send_realtime() returns only after audio_stream_end=True is sent.
+                # send_realtime() returns after sending audio_stream_end=True.
                 await send_task
 
-                # Wait for the original quiet audio to finish.
+                # Finish the quiet original audio playback.
                 await original_playback_queue.join()
 
                 play_original_task.cancel()
@@ -325,7 +354,7 @@ async def run(
                     return_exceptions=True,
                 )
 
-                # Wait for Gemini to finish generating the translated response.
+                # Wait for Gemini's final response.
                 try:
                     await asyncio.wait_for(
                         turn_complete_event.wait(),
@@ -333,11 +362,12 @@ async def run(
                     )
                 except asyncio.TimeoutError:
                     print(
-                        "\n[Warning] Gemini never sent turn_complete. "
-                        "The session may still be waiting for input."
+                        "[Warning] Gemini did not send turn_complete "
+                        "within 30 seconds.",
+                        flush=True,
                     )
 
-                # Now all output audio already received should be queued.
+                # Play all translated audio already received.
                 try:
                     await asyncio.wait_for(
                         audio_queue_output.join(),
@@ -345,7 +375,9 @@ async def run(
                     )
                 except asyncio.TimeoutError:
                     print(
-                        "\n[Warning] Timed out waiting for translated audio playback."
+                        "[Warning] Timed out waiting for translated "
+                        "audio playback.",
+                        flush=True,
                     )
 
                 receive_task.cancel()
@@ -357,47 +389,17 @@ async def run(
                     return_exceptions=True,
                 )
 
-                # Tell the active sender that no more audio is coming.
-                await audio_queue_input.put(_END)
-
-                # Wait until all audio chunks and the _END marker are sent.
-                await audio_queue_input.join()
-
-                # The sender exits itself after sending audio_stream_end=True.
-                await send_task
-
-                # Finish playing the original quiet audio.
-                await original_playback_queue.join()
-                play_original_task.cancel()
-                await asyncio.gather(
-                    play_original_task,
-                    return_exceptions=True,
-                )
-
-                # Give Gemini time to return the final translated audio.
-                try:
-                    await asyncio.wait_for(
-                        audio_queue_output.join(),
-                        timeout=15.0,
-                    )
-                except asyncio.TimeoutError:
-                    print("[Warning] Timed out waiting for final translated audio.")
-
-                # Only cancel receiving/playback after output has had time to finish.
-                receive_task.cancel()
-                play_task.cancel()
-
-                await asyncio.gather(
-                    receive_task,
-                    play_task,
-                    return_exceptions=True,
-                )
-        turn_complete_event = asyncio.Event()        
-                
     except BaseException as e:
-        print("\n[Error] Live session error:", repr(e), flush=True)
-        traceback.print_exception(type(e), e, e.__traceback__)
-
+        print(
+            f"\n[Error] Live session error: {e!r}",
+            flush=True,
+        )
+        traceback.print_exception(
+            type(e),
+            e,
+            e.__traceback__,
+        )
+        
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stream audio URL to Gemini Live Translate CLI")
     parser.add_argument("--url", default="https://storage.googleapis.com/generativeai-downloads/gemini-cookbook/audio/gemini-live-translate-sample.wav", help="Audio URL to stream (default: https://storage.googleapis.com/generativeai-downloads/gemini-cookbook/audio/gemini-live-translate-sample.wav)")

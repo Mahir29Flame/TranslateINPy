@@ -121,20 +121,29 @@ async def stream_audio_url(url: str, audio_queue: asyncio.Queue, original_playba
                 pass
         print("\n[Info] Audio stream finished.")
 
+_END = object()
+
 async def send_realtime(session, audio_queue: asyncio.Queue):
-    """Sends audio from the input queue to the GenAI session."""
     try:
         while True:
             chunk = await audio_queue.get()
-            await session.send_realtime_input(
-                audio=types.Blob(
-                    data=chunk,
-                    mime_type=f"audio/pcm;rate={SEND_SAMPLE_RATE}"
+
+            try:
+                if chunk is _END:
+                    await session.send_realtime_input(audio_stream_end=True)
+                    return
+
+                await session.send_realtime_input(
+                    audio=types.Blob(
+                        data=chunk,
+                        mime_type=f"audio/pcm;rate={SEND_SAMPLE_RATE}",
+                    )
                 )
-            )
-            audio_queue.task_done()
+            finally:
+                audio_queue.task_done()
+
     except asyncio.CancelledError:
-        pass
+        raise
 
 async def receive_responses(session, audio_queue_output: asyncio.Queue):
     """Receives responses from Gemini, plays audio and prints transcripts."""
@@ -262,11 +271,13 @@ async def run(
                 await original_playback_queue.join()
                 play_original_task.cancel()
                 
-                # Give Gemini time to send final output
-                await asyncio.sleep(4.0)
+                await stream_task
 
-                # Wait until all received audio has actually played
-                await audio_queue_output.join()
+                # Tell the sender that no more audio will arrive.
+                await audio_queue_input.put(_END)
+
+                # Wait until every audio chunk, including _END, was sent.
+                await audio_queue_input.join()
 
                 receive_task.cancel()
                 play_task.cancel()

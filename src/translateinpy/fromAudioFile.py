@@ -39,7 +39,7 @@ To run the script:
 python Get_started_LiveTranslate.py --url "https://storage.googleapis.com/generativeai-downloads/gemini-cookbook/audio/gemini-live-translate-sample.wav" --target es
 ```
 """
-
+import traceback
 import os
 import array
 import asyncio
@@ -394,8 +394,9 @@ async def run(
                 )
         turn_complete_event = asyncio.Event()        
                 
-    except Exception as e:
-        print(f"[Error] Live session error: {e}")
+    except BaseException as e:
+        print("\n[Error] Live session error:", repr(e), flush=True)
+        traceback.print_exception(type(e), e, e.__traceback__)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Stream audio URL to Gemini Live Translate CLI")

@@ -39,79 +39,135 @@ To run the script:
 python Get_started_LiveTranslate.py --url "https://storage.googleapis.com/generativeai-downloads/gemini-cookbook/audio/gemini-live-translate-sample.wav" --target es
 ```
 """
-import traceback
-import os
+
+import time
+import argparse
 import array
 import asyncio
-import argparse
+import os
+import traceback
+
 import pyaudio
 from google import genai
 from google.genai import types
 
-# Audio Configuration
+
+# Audio configuration
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-SEND_SAMPLE_RATE = 16000
-RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE = 1600  # samples per chunk (100ms at 16kHz)
+
+SEND_SAMPLE_RATE = 16_000
+RECEIVE_SAMPLE_RATE = 24_000
+
+# 100 ms at 16 kHz
+CHUNK_SIZE = 1_600
+
+
+# Queue markers
+_INPUT_END = object()
+_OUTPUT_END = object()
+
 
 def adjust_volume(pcm_data: bytes, volume: float) -> bytes:
-    """Scales raw PCM 16-bit signed samples by the volume factor."""
+    """Reduce the volume of signed 16-bit PCM audio."""
+
     if volume >= 1.0:
         return pcm_data
+
     if volume <= 0.0:
-        return b'\x00' * len(pcm_data)
-    
-    samples = array.array('h', pcm_data)
-    for i in range(len(samples)):
-        samples[i] = int(samples[i] * volume)
+        return b"\x00" * len(pcm_data)
+
+    samples = array.array("h", pcm_data)
+
+    for index in range(len(samples)):
+        samples[index] = int(samples[index] * volume)
+
     return samples.tobytes()
 
-async def stream_audio_url(url: str, audio_queue: asyncio.Queue, original_playback_queue: asyncio.Queue = None, volume: float = 0.08):
-    """Streams audio from an HTTP URL, decoding it via ffmpeg and putting raw PCM bytes into the audio_queue."""
-    print(f"\n[Info] Starting audio stream via ffmpeg from: {url}")
-    # Spawn ffmpeg to decode stream to raw PCM 16kHz mono 16-bit
+
+async def stream_audio_url(
+    url: str,
+    audio_queue: asyncio.Queue,
+    original_playback_queue: asyncio.Queue | None = None,
+    volume: float = 0.08,
+) -> None:
+    """
+    Decode an audio file/URL with FFmpeg and place PCM chunks in the queue.
+    """
+
+    print(f"\n[Info] Starting audio stream from: {url}", flush=True)
+
     process = await asyncio.create_subprocess_exec(
-        'ffmpeg',
-        '-i', url,
-        '-f', 's16le',
-        '-acodec', 'pcm_s16le',
-        '-ar', str(SEND_SAMPLE_RATE),
-        '-ac', str(CHANNELS),
-        '-',
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        url,
+        "-f",
+        "s16le",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        str(SEND_SAMPLE_RATE),
+        "-ac",
+        str(CHANNELS),
+        "-",
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL
+        stderr=asyncio.subprocess.PIPE,
     )
 
-    # 1600 samples * 2 bytes/sample (16-bit) = 3200 bytes
     chunk_size_bytes = CHUNK_SIZE * 2
     bytes_per_second = SEND_SAMPLE_RATE * 2
-    start_time = asyncio.get_event_loop().time()
+
+    start_time = asyncio.get_running_loop().time()
     bytes_sent = 0
 
     try:
         while True:
             data = await process.stdout.read(chunk_size_bytes)
+
             if not data:
                 break
-            
+
             await audio_queue.put(data)
-            
-            # Put quieted audio into original playback queue
-            if original_playback_queue is not None and volume > 0.0:
+
+            if (
+                original_playback_queue is not None
+                and volume > 0.0
+            ):
                 quiet_data = adjust_volume(data, volume)
                 await original_playback_queue.put(quiet_data)
-                
+
             bytes_sent += len(data)
-            
-            # Rate limit to exactly 1.0x real-time playback speed
+
             expected_elapsed = bytes_sent / bytes_per_second
-            actual_elapsed = asyncio.get_event_loop().time() - start_time
+            actual_elapsed = (
+                asyncio.get_running_loop().time() - start_time
+            )
+
             sleep_time = expected_elapsed - actual_elapsed
+
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
+
+        # FFmpeg has reached EOF. Now wait for its exit status.
+        stderr_data = await process.stderr.read()
+        return_code = await process.wait()
+
+        if return_code != 0:
+            error_text = stderr_data.decode(
+                errors="replace"
+            ).strip()
+
+            raise RuntimeError(
+                f"FFmpeg failed with exit code {return_code}"
+                + (f": {error_text}" if error_text else "")
+            )
+
     except asyncio.CancelledError:
         raise
+
     finally:
         if process.returncode is None:
             try:
@@ -119,99 +175,209 @@ async def stream_audio_url(url: str, audio_queue: asyncio.Queue, original_playba
                 await process.wait()
             except Exception:
                 pass
-        print("\n[Info] Audio stream finished.")
 
-_END = object()
+        print("\n[Info] Audio stream finished.", flush=True)
 
-async def send_realtime(session, audio_queue: asyncio.Queue):
+
+async def send_realtime(
+    session,
+    audio_queue: asyncio.Queue,
+) -> None:
+    """Send PCM audio chunks to Gemini."""
+
     try:
         while True:
             chunk = await audio_queue.get()
 
             try:
-                if chunk is _END:
-                    await session.send_realtime_input(audio_stream_end=True)
+                if chunk is _INPUT_END:
+                    await session.send_realtime_input(
+                        audio_stream_end=True
+                    )
                     return
 
                 await session.send_realtime_input(
                     audio=types.Blob(
                         data=chunk,
-                        mime_type=f"audio/pcm;rate={SEND_SAMPLE_RATE}",
+                        mime_type=(
+                            f"audio/pcm;rate={SEND_SAMPLE_RATE}"
+                        ),
                     )
                 )
+
             finally:
                 audio_queue.task_done()
 
     except asyncio.CancelledError:
         raise
 
+
 async def receive_responses(
     session,
     audio_queue_output: asyncio.Queue,
-    turn_complete_event: asyncio.Event,
-):
-    """Receives Gemini audio and transcription responses."""
+    response_complete_event: asyncio.Event,
+    last_activity: list,
+) -> None:
+    """Receive translated audio and transcription responses."""
+
     try:
         async for response in session.receive():
-            server_content = response.server_content
+            server_content = getattr(
+                response,
+                "server_content",
+                None,
+            )
 
-            if not server_content:
+            last_activity[0] = time.monotonic()
+
+            if isinstance(audio_data, bytes):
+                last_activity[0] = time.monotonic()
+                await audio_queue_output.put(audio_data)
+                        
+            if server_content is None:
                 continue
 
-            # Process every model audio part before checking turn completion.
-            if server_content.model_turn:
-                for part in server_content.model_turn.parts:
-                    if (
-                        part.inline_data
-                        and isinstance(part.inline_data.data, bytes)
-                    ):
-                        await audio_queue_output.put(part.inline_data.data)
+            model_turn = getattr(
+                server_content,
+                "model_turn",
+                None,
+            )
+
+            model_turn = getattr(
+                server_content,
+                "model_turn",
+                None,
+            )
+
+            if model_turn is not None:
+                for part in model_turn.parts:
+                    inline_data = getattr(
+                        part,
+                        "inline_data",
+                        None,
+                    )
+
+                    if inline_data is None:
+                        continue
+
+                    audio_data = getattr(
+                        inline_data,
+                        "data",
+                        None,
+                    )
+
+                    if isinstance(audio_data, bytes):
+                        last_activity[0] = time.monotonic()
+
+                        await audio_queue_output.put(audio_data)
+
+                        input_transcription = getattr(
+                            server_content,
+                            "input_transcription",
+                            None,
+                        )
 
             if (
-                server_content.input_transcription
-                and server_content.input_transcription.text
+                input_transcription is not None
+                and input_transcription.text
             ):
-                lang = (
-                    f" ({server_content.input_transcription.language_code})"
-                    if server_content.input_transcription.language_code
+                language_code = getattr(
+                    input_transcription,
+                    "language_code",
+                    None,
+                )
+
+                language = (
+                    f" ({language_code})"
+                    if language_code
                     else ""
                 )
+
                 print(
-                    f"\n[Source{lang}] "
-                    f"{server_content.input_transcription.text}",
+                    f"\n[Source{language}] "
+                    f"{input_transcription.text}",
                     flush=True,
                 )
 
+            output_transcription = getattr(
+                server_content,
+                "output_transcription",
+                None,
+            )
+
             if (
-                server_content.output_transcription
-                and server_content.output_transcription.text
+                output_transcription is not None
+                and output_transcription.text
             ):
-                lang = (
-                    f" ({server_content.output_transcription.language_code})"
-                    if server_content.output_transcription.language_code
+                language_code = getattr(
+                    output_transcription,
+                    "language_code",
+                    None,
+                )
+
+                language = (
+                    f" ({language_code})"
+                    if language_code
                     else ""
                 )
+
                 print(
-                    f"\n[Translation{lang}] "
-                    f"{server_content.output_transcription.text}",
+                    f"\n[Translation{language}] "
+                    f"{output_transcription.text}",
                     flush=True,
                 )
 
-            # This is the actual end of Gemini's response turn.
-            if server_content.turn_complete:
-                print("\n[Info] Gemini turn complete.", flush=True)
-                turn_complete_event.set()
+            turn_complete = getattr(
+                server_content,
+                "turn_complete",
+                False,
+            )
+
+            generation_complete = getattr(
+                server_content,
+                "generation_complete",
+                False,
+            )
+
+            if turn_complete or generation_complete:
+                print(
+                    "\n[Info] Gemini response complete.",
+                    flush=True,
+                )
+
+                response_complete_event.set()
+
+                # All audio parts from this response were processed
+                # before this marker was inserted.
+                await audio_queue_output.put(_OUTPUT_END)
+
+                return
 
     except asyncio.CancelledError:
         raise
 
-    except Exception as e:
-        print(f"\n[Error] Receiving loop encountered error: {e}")
-        turn_complete_event.set()
+    except Exception:
+        print(
+            "\n[Error] Receiver crashed:",
+            flush=True,
+        )
 
-async def play_audio(audio_queue_output: asyncio.Queue):
-    """Plays translated audio from the output queue."""
+        traceback.print_exc()
+
+        response_complete_event.set()
+
+        # Allow the player to shut down if receiving fails.
+        await audio_queue_output.put(_OUTPUT_END)
+
+
+async def play_audio(
+    audio_queue_output: asyncio.Queue,
+) -> None:
+    """Play translated audio until _OUTPUT_END is received."""
+
     pya = pyaudio.PyAudio()
+    stream = None
+
     try:
         stream = await asyncio.to_thread(
             pya.open,
@@ -220,51 +386,92 @@ async def play_audio(audio_queue_output: asyncio.Queue):
             rate=RECEIVE_SAMPLE_RATE,
             output=True,
         )
+
         while True:
-            bytestream = await audio_queue_output.get()
-            await asyncio.to_thread(stream.write, bytestream)
-            audio_queue_output.task_done()
+            audio_data = await audio_queue_output.get()
+
+            try:
+                if audio_data is _OUTPUT_END:
+                    return
+
+                await asyncio.to_thread(
+                    stream.write,
+                    audio_data,
+                )
+
+            finally:
+                audio_queue_output.task_done()
+
     except asyncio.CancelledError:
-        pass
+        raise
+
     finally:
-        try:
-            stream.stop_stream()
-            stream.close()
-        except Exception:
-            pass
+        if stream is not None:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+
         pya.terminate()
 
-async def play_original_audio(original_playback_queue: asyncio.Queue):
-    """Plays quieted original background audio from the queue."""
+
+async def play_original_audio(
+    original_playback_queue: asyncio.Queue,
+) -> None:
+    """Play the quiet original audio."""
+
     pya = pyaudio.PyAudio()
+    stream = None
+
     try:
         stream = await asyncio.to_thread(
             pya.open,
             format=FORMAT,
             channels=CHANNELS,
-            rate=SEND_SAMPLE_RATE,  # 16000Hz (original audio rate)
+            rate=SEND_SAMPLE_RATE,
             output=True,
         )
+
         while True:
-            bytestream = await original_playback_queue.get()
-            await asyncio.to_thread(stream.write, bytestream)
-            original_playback_queue.task_done()
+            audio_data = await original_playback_queue.get()
+
+            try:
+                await asyncio.to_thread(
+                    stream.write,
+                    audio_data,
+                )
+
+            finally:
+                original_playback_queue.task_done()
+
     except asyncio.CancelledError:
-        pass
+        raise
+
     finally:
-        try:
-            stream.stop_stream()
-            stream.close()
-        except Exception:
-            pass
+        if stream is not None:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+
         pya.terminate()
+
 
 async def run(
     url: str,
     target_lang: str,
     api_key: str,
     original_volume: float = 0.08,
-):
+) -> None:
+    """Run the live audio translation."""
+
+    if not api_key:
+        raise ValueError(
+            "A Gemini API key is required."
+        )
+
     client = genai.Client(api_key=api_key)
 
     config = types.LiveConnectConfig(
@@ -273,153 +480,263 @@ async def run(
             echo_target_language=True,
             target_language_code=target_lang,
         ),
-        input_audio_transcription=types.AudioTranscriptionConfig(),
-        output_audio_transcription=types.AudioTranscriptionConfig(),
+        input_audio_transcription=(
+            types.AudioTranscriptionConfig()
+        ),
+        output_audio_transcription=(
+            types.AudioTranscriptionConfig()
+        ),
     )
 
-    audio_queue_input = asyncio.Queue(maxsize=10)
+    audio_queue_input = asyncio.Queue(maxsize=50)
     audio_queue_output = asyncio.Queue()
     original_playback_queue = asyncio.Queue()
 
-    # Create this BEFORE receive_responses() uses it.
-    turn_complete_event = asyncio.Event()
+    response_complete_event = asyncio.Event()
+    last_activity = [time.monotonic()]
 
     model = "gemini-3.5-live-translate-preview"
-    print(f"[Info] Connecting to Gemini Live ({model})...")
 
-    try:
-        async with client.aio.live.connect(
-            model=model,
-            config=config,
-        ) as session:
-            print("[Info] Connected successfully. Ready to stream!")
+    print(
+        f"[Info] Connecting to Gemini Live ({model})...",
+        flush=True,
+    )
 
-            async with asyncio.TaskGroup() as tg:
-                stream_task = tg.create_task(
-                    stream_audio_url(
-                        url,
-                        audio_queue_input,
-                        original_playback_queue,
-                        original_volume,
-                    )
+    async with client.aio.live.connect(
+        model=model,
+        config=config,
+    ) as session:
+        print(
+            "[Info] Connected successfully. Ready to stream!",
+            flush=True,
+        )
+
+        async with asyncio.TaskGroup() as task_group:
+            stream_task = task_group.create_task(
+                stream_audio_url(
+                    url=url,
+                    audio_queue=audio_queue_input,
+                    original_playback_queue=(
+                        original_playback_queue
+                    ),
+                    volume=original_volume,
                 )
+            )
 
-                send_task = tg.create_task(
-                    send_realtime(
-                        session,
-                        audio_queue_input,
-                    )
+            send_task = task_group.create_task(
+                send_realtime(
+                    session=session,
+                    audio_queue=audio_queue_input,
                 )
+            )
 
-                receive_task = tg.create_task(
-                    receive_responses(
-                        session,
-                        audio_queue_output,
-                        turn_complete_event,
-                    )
+            receive_task = task_group.create_task(
+                receive_responses(
+                    session=session,
+                    audio_queue_output=audio_queue_output,
+                    response_complete_event=response_complete_event,
+                    last_activity=last_activity,
                 )
+            )
 
-                play_task = tg.create_task(
-                    play_audio(audio_queue_output)
+            play_task = task_group.create_task(
+                play_audio(
+                    audio_queue_output=audio_queue_output,
                 )
+            )
 
-                play_original_task = tg.create_task(
-                    play_original_audio(original_playback_queue)
+            original_play_task = task_group.create_task(
+                play_original_audio(
+                    original_playback_queue=(
+                        original_playback_queue
+                    ),
                 )
+            )
 
-                # Critical: wait until FFmpeg has produced and queued
-                # the complete input file.
-                await stream_task
+            # Wait until FFmpeg has completely finished reading
+            # and queueing the input file.
+            await stream_task
 
+            print(
+                "[Info] Input finished. "
+                "Sending end-of-stream marker...",
+                flush=True,
+            )
+
+            # The sender is still alive here.
+            await audio_queue_input.put(_INPUT_END)
+
+            # Wait until every input chunk and the end marker
+            # have been sent to Gemini.
+            await audio_queue_input.join()
+
+            # send_realtime() returns after sending
+            # audio_stream_end=True.
+            await send_task
+
+            # Wait for the quiet original audio to finish.
+            await original_playback_queue.join()
+
+            original_play_task.cancel()
+
+            await asyncio.gather(
+                original_play_task,
+                return_exceptions=True,
+            )
+
+            # Wait for Gemini's final response signal.
+            # Gemini may not send generation_complete or turn_complete
+            # for this translation stream. Wait until the response becomes
+            # quiet instead.
+            last_activity[0] = time.monotonic()
+
+            quiet_period = 5.0
+            maximum_wait = 45.0
+            deadline = time.monotonic() + maximum_wait
+
+            while time.monotonic() < deadline:
+                quiet_for = time.monotonic() - last_activity[0]
+
+                if quiet_for >= quiet_period:
+                    break
+
+                await asyncio.sleep(0.25)
+
+            if time.monotonic() >= deadline:
                 print(
-                    "[Info] Input finished. Sending end-of-stream marker...",
+                    "[Warning] Gemini response timeout reached.",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[Info] Gemini response is quiet. "
+                    "Finishing playback.",
                     flush=True,
                 )
 
-                # send_task is still alive here.
-                await audio_queue_input.put(_END)
+            # This is now safe because Gemini has been quiet for 5 seconds.
+            await audio_queue_output.put(_OUTPUT_END)
 
-                # Wait until every input chunk and _END are sent.
-                await audio_queue_input.join()
-
-                # send_realtime() returns after sending audio_stream_end=True.
-                await send_task
-
-                # Finish the quiet original audio playback.
-                await original_playback_queue.join()
-
-                play_original_task.cancel()
-                await asyncio.gather(
-                    play_original_task,
-                    return_exceptions=True,
+# Let the player finish every queued audio chunk.
+            try:
+                await asyncio.wait_for(
+                    play_task,
+                    timeout=30.0,
                 )
-
-                # Wait for Gemini's final response.
-                try:
-                    await asyncio.wait_for(
-                        turn_complete_event.wait(),
-                        timeout=30.0,
-                    )
-                except asyncio.TimeoutError:
-                    print(
-                        "[Warning] Gemini did not send turn_complete "
-                        "within 30 seconds.",
-                        flush=True,
-                    )
-
-                # Play all translated audio already received.
-                try:
-                    await asyncio.wait_for(
-                        audio_queue_output.join(),
-                        timeout=30.0,
-                    )
-                except asyncio.TimeoutError:
-                    print(
-                        "[Warning] Timed out waiting for translated "
-                        "audio playback.",
-                        flush=True,
-                    )
-
-                receive_task.cancel()
+            except asyncio.TimeoutError:
+                print(
+                    "[Warning] Final audio playback timed out.",
+                    flush=True,
+                )
                 play_task.cancel()
 
-                await asyncio.gather(
-                    receive_task,
-                    play_task,
-                    return_exceptions=True,
-                )
+            # The receiver should already have ended after
+            # generation_complete or turn_complete.
+            if not receive_task.done():
+                receive_task.cancel()
 
-    except BaseException as e:
+            await asyncio.gather(
+                receive_task,
+                play_task,
+                return_exceptions=True,
+            )
+
+
+def Translator(
+    url: str,
+    target_lang: str,
+    api_key: str,
+    original_volume: float = 0.08,
+):
+    """Public synchronous API."""
+
+    if not url:
+        print("[Error] URL cannot be empty.")
+        return
+
+    if not target_lang:
+        print("[Error] Target language cannot be empty.")
+        return
+
+    if not api_key:
+        print("[Error] API key cannot be empty.")
+        return
+
+    if not 0.0 <= original_volume <= 1.0:
         print(
-            f"\n[Error] Live session error: {e!r}",
-            flush=True,
+            "[Error] Original volume must be between 0 and 1."
         )
-        traceback.print_exception(
-            type(e),
-            e,
-            e.__traceback__,
+        return
+
+    return asyncio.run(
+        run(
+            url=url,
+            target_lang=target_lang,
+            api_key=api_key,
+            original_volume=original_volume,
         )
-        
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stream audio URL to Gemini Live Translate CLI")
-    parser.add_argument("--url", default="https://storage.googleapis.com/generativeai-downloads/gemini-cookbook/audio/gemini-live-translate-sample.wav", help="Audio URL to stream (default: https://storage.googleapis.com/generativeai-downloads/gemini-cookbook/audio/gemini-live-translate-sample.wav)")
-    parser.add_argument("--target", default="bn", help="Target translation language code (default: bn)")
-    parser.add_argument("--api_key", default=os.getenv("GEMINI_API_KEY"), help="API key (default: None)")
-    parser.add_argument("--original-volume", type=float, default=0.08, help="Volume of original background audio (0.0 to 1.0, default: 0.08)")
+    )
+
+
+if cli():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Stream audio from a file or URL and translate it "
+            "using Gemini Live."
+        )
+    )
+
+    parser.add_argument(
+        "--url",
+        default=(
+            "https://storage.googleapis.com/"
+            "generativeai-downloads/gemini-cookbook/audio/"
+            "gemini-live-translate-sample.wav"
+        ),
+        help="Audio file path or URL.",
+    )
+
+    parser.add_argument(
+        "--target",
+        default="bn",
+        help="Target language code.",
+    )
+
+    parser.add_argument(
+        "--api_key",
+        default=os.getenv("GEMINI_API_KEY"),
+        help="Gemini API key.",
+    )
+
+    parser.add_argument(
+        "--original-volume",
+        type=float,
+        default=0.08,
+        help="Original audio volume from 0.0 to 1.0.",
+    )
+
     args = parser.parse_args()
 
     try:
-        asyncio.run(run(args.url, args.target, args.api_key, args.original_volume))
-    except KeyboardInterrupt:
-        print("\n[Info] Interrupted by user. Exiting...")
+        asyncio.run(
+            run(
+                url=args.url,
+                target_lang=args.target,
+                api_key=args.api_key,
+                original_volume=args.original_volume,
+            )
+        )
 
-def Translator(url: str, target_lang: str, api_key: str, original_volume: float = 0.08):
-    if url == "":
-        return print("[Error] URL cannot be empty")
-    if target_lang == "":
-        return print("[Error] Target language cannot be empty")
-    if api_key == "":
-        return print("[Error] API key cannot be empty")
-    if original_volume < 0 or original_volume > 1:
-        return print("[Error] Original volume must be between 0 and 1")
-    return asyncio.run(run(url, target_lang, api_key, original_volume))
+    except KeyboardInterrupt:
+        print(
+            "\n[Info] Interrupted by user.",
+            flush=True,
+        )
+
+    except Exception as error:
+        print(
+            f"\n[Error] {error}",
+            flush=True,
+        )
+
+        traceback.print_exc()

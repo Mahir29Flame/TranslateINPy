@@ -31,13 +31,6 @@ brew install ffmpeg
 Before running this script, ensure the `GEMINI_API_KEY` environment
 variable is set to the api-key you obtained from Google AI Studio.
 
-## Run
-
-To run the script:
-
-```
-python Get_started_LiveTranslate.py --url "https://storage.googleapis.com/generativeai-downloads/gemini-cookbook/audio/gemini-live-translate-sample.wav" --target es
-```
 """
 
 import time
@@ -47,7 +40,11 @@ import asyncio
 import os
 import traceback
 
-import pyaudio
+try:
+    import pyaudiowpatch as pyaudio
+except ImportError:
+    import pyaudio
+
 from google import genai
 from google.genai import types
 
@@ -230,18 +227,8 @@ async def receive_responses(
 
             last_activity[0] = time.monotonic()
 
-            if isinstance(audio_data, bytes):
-                last_activity[0] = time.monotonic()
-                await audio_queue_output.put(audio_data)
-                        
             if server_content is None:
                 continue
-
-            model_turn = getattr(
-                server_content,
-                "model_turn",
-                None,
-            )
 
             model_turn = getattr(
                 server_content,
@@ -268,14 +255,13 @@ async def receive_responses(
 
                     if isinstance(audio_data, bytes):
                         last_activity[0] = time.monotonic()
-
                         await audio_queue_output.put(audio_data)
 
-                        input_transcription = getattr(
-                            server_content,
-                            "input_transcription",
-                            None,
-                        )
+            input_transcription = getattr(
+                server_content,
+                "input_transcription",
+                None,
+            )
 
             if (
                 input_transcription is not None
@@ -678,7 +664,7 @@ def Translator(
     )
 
 
-if cli():
+def cli():
     parser = argparse.ArgumentParser(
         description=(
             "Stream audio from a file or URL and translate it "
@@ -687,19 +673,22 @@ if cli():
     )
 
     parser.add_argument(
+        "audio",
+        nargs="?",
+        default=None,
+        help="Audio file path or URL (positional).",
+    )
+
+    parser.add_argument(
         "--url",
-        default=(
-            "https://storage.googleapis.com/"
-            "generativeai-downloads/gemini-cookbook/audio/"
-            "gemini-live-translate-sample.wav"
-        ),
+        default=None,
         help="Audio file path or URL.",
     )
 
     parser.add_argument(
         "--target",
         default="bn",
-        help="Target language code.",
+        help="Target language code (e.g., 'bn', 'es', 'fr', 'en').",
     )
 
     parser.add_argument(
@@ -717,10 +706,28 @@ if cli():
 
     args = parser.parse_args()
 
+    audio_source = (
+        args.audio
+        or args.url
+        or (
+            "https://storage.googleapis.com/"
+            "generativeai-downloads/gemini-cookbook/audio/"
+            "gemini-live-translate-sample.wav"
+        )
+    )
+
+    if any(sep in args.target for sep in ("/", "\\", ".")):
+        print(
+            f"[Error] '{args.target}' does not look like a language code (e.g., 'bn', 'es', 'en'). "
+            "Did you pass the audio file to --target instead of as the audio file?",
+            flush=True,
+        )
+        return
+
     try:
         asyncio.run(
             run(
-                url=args.url,
+                url=audio_source,
                 target_lang=args.target,
                 api_key=args.api_key,
                 original_volume=args.original_volume,
@@ -740,3 +747,7 @@ if cli():
         )
 
         traceback.print_exc()
+
+
+if __name__ == "__main__":
+    cli()        

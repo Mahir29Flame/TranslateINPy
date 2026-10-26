@@ -1,11 +1,14 @@
 [project]
-name = "translateinpy"
-version = "1.0.0"
-description = "Add your description here"
+name = "TranslateINPy"
+version = "1.5.0"
+description = "A Python translation module and CLI tool which works with Gemini Live Translate API for Audio file translation."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "google-genai>=1.35.0",
-    "pyaudiowpatch>=0.5.2",
+    "pyaudiowpatch<=0.2.12.9",
     "ffmpeg>=0.2.0",
 ]
+
+[project.scripts]
+TranslateINPy = "translateinpy.fromAudioFile:cli"

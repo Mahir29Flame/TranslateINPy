@@ -1,5 +1,5 @@
 # TranslateINPy
-A python translation module for translating live responses using Gemini API inside your application.
+A python translation module for translating live responses using Gemini API inside your application.\
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/translateinpy?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=BLUE&left_text=Downloads)](https://pepy.tech/projects/translateinpy)
 
 ## Usage
